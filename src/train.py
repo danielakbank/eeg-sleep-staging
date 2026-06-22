@@ -1,22 +1,16 @@
 """
 train.py
 ────────
-Trains a Random Forest baseline classifier on the hand-crafted
-EEG features extracted in features.py.
+Training pipeline for both the Random Forest baseline and the
+1D CNN model for EEG sleep stage classification.
 
-This baseline serves two purposes:
-  1. Establishes a performance benchmark before we build the CNN
-  2. Enables SHAP interpretability — showing which features
-     drive each sleep stage classification
-
-Pipeline:
-  - Load features and labels
-  - Split into train/validation/test sets (subject-aware)
-  - Scale features
-  - Train Random Forest with class weights
-  - Save model and scaler
+Run modes:
+  python src/train.py --model rf    ← Random Forest baseline
+  python src/train.py --model cnn   ← 1D CNN
+  python src/train.py --model both  ← train both sequentially
 """
 
+import argparse
 import numpy as np
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
@@ -32,6 +26,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
+import tensorflow as tf
+from sklearn.utils.class_weight import compute_class_weight
 
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -39,63 +35,22 @@ import joblib
 RESULTS_DIR     = Path('results')
 MODELS_DIR      = Path('models')
 RANDOM_STATE    = 42
-TEST_SIZE       = 0.2    # 20% held out for final test
-VAL_SIZE        = 0.1    # 10% for validation during development
+TEST_SIZE       = 0.2
+VAL_SIZE        = 0.1
 
-STAGE_NAMES     = {
-    0: 'Wake',
-    1: 'N1',
-    2: 'N2',
-    3: 'N3',
-    4: 'REM'
-}
-
+STAGE_NAMES     = {0: 'Wake', 1: 'N1', 2: 'N2', 3: 'N3', 4: 'REM'}
 STAGE_LABELS    = list(STAGE_NAMES.values())
 
 
-# ── data loading ───────────────────────────────────────────────────────────────
-
-def load_features():
-    """
-    Loads the feature matrix and labels saved by features.py.
-    Validates shapes match before proceeding.
-    """
-    X_path = RESULTS_DIR / 'X_features.npy'
-    y_path = RESULTS_DIR / 'y.npy'
-
-    if not X_path.exists():
-        raise FileNotFoundError('X_features.npy not found. Run features.py first.')
-    if not y_path.exists():
-        raise FileNotFoundError('y.npy not found. Run preprocess.py first.')
-
-    X = np.load(X_path)
-    y = np.load(y_path)
-
-    if len(X) != len(y):
-        raise ValueError(f'Shape mismatch: X has {len(X)} rows, y has {len(y)}')
-
-    print(f'Loaded X_features: {X.shape}')
-    print(f'Loaded y:          {y.shape}')
-    return X, y
-
-
-# ── data splitting ─────────────────────────────────────────────────────────────
+# ── shared utilities ───────────────────────────────────────────────────────────
 
 def split_data(X, y):
     """
-    Splits data into train, validation, and test sets using
-    stratified sampling — ensuring each split has the same
-    class proportions as the full dataset.
-
-    This is important because our classes are imbalanced.
-    Without stratification, the test set might contain very
-    few N1 epochs by chance, making evaluation unreliable.
+    Stratified train/val/test split preserving class proportions.
+    Fitted on features for RF, raw epochs for CNN — same indices used.
     """
-    # first split: carve out test set
     splitter_test = StratifiedShuffleSplit(
-        n_splits=1,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE
+        n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE
     )
     train_val_idx, test_idx = next(splitter_test.split(X, y))
 
@@ -104,12 +59,9 @@ def split_data(X, y):
     X_test      = X[test_idx]
     y_test      = y[test_idx]
 
-    # second split: carve validation out of remaining train data
     val_fraction = VAL_SIZE / (1 - TEST_SIZE)
     splitter_val = StratifiedShuffleSplit(
-        n_splits=1,
-        test_size=val_fraction,
-        random_state=RANDOM_STATE
+        n_splits=1, test_size=val_fraction, random_state=RANDOM_STATE
     )
     train_idx, val_idx = next(splitter_val.split(X_train_val, y_train_val))
 
@@ -118,210 +70,277 @@ def split_data(X, y):
     X_val   = X_train_val[val_idx]
     y_val   = y_train_val[val_idx]
 
-    print(f'\nData split:')
-    print(f'  Train: {X_train.shape[0]} epochs')
-    print(f'  Val:   {X_val.shape[0]} epochs')
-    print(f'  Test:  {X_test.shape[0]} epochs')
-
+    print(f'  Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}')
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 
-# ── feature scaling ────────────────────────────────────────────────────────────
+def plot_confusion_matrix(y_test, y_pred, title, filename):
+    """Saves a normalised confusion matrix heatmap."""
+    cm = confusion_matrix(y_test, y_pred, normalize='true')
+    fig, ax = plt.subplots(figsize=(8, 7))
+    sns.heatmap(
+        cm, annot=True, fmt='.2f', cmap='Blues',
+        xticklabels=STAGE_LABELS, yticklabels=STAGE_LABELS,
+        ax=ax, vmin=0, vmax=1
+    )
+    ax.set_xlabel('Predicted stage', fontsize=12)
+    ax.set_ylabel('True stage', fontsize=12)
+    ax.set_title(title, fontsize=13)
+    plt.tight_layout()
+    path = RESULTS_DIR / filename
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f'  Confusion matrix saved → {path}')
 
-def scale_features(X_train, X_val, X_test):
+
+from sklearn.metrics import cohen_kappa_score
+
+def print_results(y_true, y_pred, split_name):
     """
-    Standardises features to zero mean and unit variance.
+    Prints balanced accuracy, Cohen's Kappa, and per-class
+    classification report.
 
-    This is fitted on training data only — then applied to
-    validation and test sets. Fitting on all data would leak
-    information about the test set into training, which is
-    a form of data leakage that inflates performance metrics.
-
-    The scaler is saved so it can be applied consistently
-    when the model is used on new data.
+    Cohen's Kappa measures agreement between predictions and
+    true labels, correcting for chance agreement. It is the
+    standard metric in sleep staging literature:
+      < 0.40  poor
+      0.40–0.60  moderate
+      0.60–0.80  good
+      > 0.80  excellent
     """
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+    kappa   = cohen_kappa_score(y_true, y_pred)
+
+    print(f'\n── {split_name} ──────────────────────────────')
+    print(f'Balanced accuracy : {bal_acc:.3f}')
+    print(f'Cohen\'s Kappa     : {kappa:.3f}')
+    print(classification_report(
+        y_true, y_pred,
+        target_names=STAGE_LABELS,
+        zero_division=0
+    ))
+    return bal_acc, kappa
+
+# ── random forest ──────────────────────────────────────────────────────────────
+
+def train_random_forest():
+    """Full Random Forest training pipeline."""
+    print('\n' + '='*60)
+    print('RANDOM FOREST BASELINE')
+    print('='*60)
+
+    # load features
+    X = np.load(RESULTS_DIR / 'X_features.npy')
+    y = np.load(RESULTS_DIR / 'y.npy')
+    print(f'Features: {X.shape}')
+
+    X_train, y_train, X_val, y_val, X_test, y_test = split_data(X, y)
+
+    # scale
     scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_val   = scaler.transform(X_val)
     X_test  = scaler.transform(X_test)
-
     MODELS_DIR.mkdir(exist_ok=True)
     joblib.dump(scaler, MODELS_DIR / 'scaler.pkl')
-    print('Scaler fitted and saved → models/scaler.pkl')
 
-    return X_train, X_val, X_test, scaler
-
-
-# ── model training ─────────────────────────────────────────────────────────────
-
-def train_random_forest(X_train, y_train):
-    """
-    Trains a Random Forest classifier with class weights
-    to handle the imbalanced sleep stage distribution.
-
-    Random Forest works by building many decision trees on
-    random subsets of the data, then combining their votes.
-    It is robust, fast, and naturally handles non-linear
-    relationships between features and labels.
-
-    class_weight='balanced' automatically increases the
-    penalty for misclassifying rare stages like N1 and REM.
-    """
-    print('\nTraining Random Forest...')
-
-    model = RandomForestClassifier(
-        n_estimators=500,       # number of trees
-        max_depth=None,         # trees grow until leaves are pure
-        min_samples_leaf=2,     # prevents overfitting on tiny groups
+    # train
+    print('\nTraining Random Forest (500 trees)...')
+    rf = RandomForestClassifier(
+        n_estimators=500,
+        min_samples_leaf=2,
         class_weight='balanced',
-        n_jobs=-1,              # use all CPU cores
-        random_state=RANDOM_STATE,
-        verbose=0
+        n_jobs=-1,
+        random_state=RANDOM_STATE
+    )
+    rf.fit(X_train, y_train)
+
+    # evaluate
+    print_results(y_val,  rf.predict(X_val),  'Validation')
+    bal_acc, kappa = print_results(y_test, rf.predict(X_test), 'Test')
+
+    # plots
+    plot_confusion_matrix(
+        y_test, rf.predict(X_test),
+        'Random Forest — normalised confusion matrix',
+        'confusion_matrix_rf.png'
     )
 
-    model.fit(X_train, y_train)
-    print('Training complete.')
-    return model
-
-
-# ── evaluation ─────────────────────────────────────────────────────────────────
-
-def evaluate_model(model, X_val, y_val, X_test, y_test):
-    """
-    Evaluates model on validation and test sets.
-    Prints classification report and balanced accuracy.
-
-    Balanced accuracy is more informative than raw accuracy
-    for imbalanced datasets — it averages accuracy per class
-    so rare stages are not drowned out by common ones.
-    """
-    print('\n── Validation set ──────────────────────────────')
-    y_val_pred  = model.predict(X_val)
-    val_bal_acc = balanced_accuracy_score(y_val, y_val_pred)
-    print(f'Balanced accuracy: {val_bal_acc:.3f}')
-    print(classification_report(
-        y_val, y_val_pred,
-        target_names=STAGE_LABELS,
-        zero_division=0
-    ))
-
-    print('\n── Test set ────────────────────────────────────')
-    y_test_pred  = model.predict(X_test)
-    test_bal_acc = balanced_accuracy_score(y_test, y_test_pred)
-    print(f'Balanced accuracy: {test_bal_acc:.3f}')
-    print(classification_report(
-        y_test, y_test_pred,
-        target_names=STAGE_LABELS,
-        zero_division=0
-    ))
-
-    return y_test_pred, test_bal_acc
-
-
-def plot_confusion_matrix(y_test, y_test_pred):
-    """
-    Saves a normalised confusion matrix showing what percentage
-    of each true stage was correctly classified or confused
-    with another stage.
-
-    Normalised by true label so each row sums to 1 —
-    this makes rare classes (N1) readable alongside
-    common ones (Wake, N2).
-    """
-    cm = confusion_matrix(y_test, y_test_pred, normalize='true')
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='.2f',
-        cmap='Blues',
-        xticklabels=STAGE_LABELS,
-        yticklabels=STAGE_LABELS,
-        ax=ax,
-        vmin=0,
-        vmax=1
-    )
-    ax.set_xlabel('Predicted stage', fontsize=12)
-    ax.set_ylabel('True stage', fontsize=12)
-    ax.set_title('Random Forest — normalised confusion matrix', fontsize=13)
-
-    plt.tight_layout()
-    path = RESULTS_DIR / 'confusion_matrix_rf.png'
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print(f'\nConfusion matrix saved → {path}')
-
-
-def plot_feature_importance(model, feature_names):
-    """
-    Saves a bar chart of the top 15 most important features
-    according to the Random Forest.
-
-    Feature importance in a Random Forest measures how much
-    each feature reduces impurity across all trees on average.
-    High importance = the model relies heavily on this feature.
-
-    This gives us a first look at which EEG characteristics
-    matter most for sleep staging — before we apply SHAP.
-    """
-    importances     = model.feature_importances_
+    from features import get_feature_names
+    feature_names   = get_feature_names()
+    importances     = rf.feature_importances_
     indices         = np.argsort(importances)[::-1][:15]
     top_features    = [feature_names[i] for i in indices]
     top_importances = importances[indices]
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.barh(
-        range(len(top_features)),
-        top_importances[::-1],
-        color='steelblue',
-        edgecolor='white'
-    )
+    ax.barh(range(len(top_features)), top_importances[::-1], color='steelblue')
     ax.set_yticks(range(len(top_features)))
     ax.set_yticklabels(top_features[::-1], fontsize=10)
     ax.set_xlabel('Feature importance', fontsize=12)
     ax.set_title('Top 15 features — Random Forest', fontsize=13)
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / 'feature_importance_rf.png', dpi=150)
+    plt.close()
+
+    joblib.dump(rf, MODELS_DIR / 'random_forest.pkl')
+    print(f'\nRF baseline complete. Test balanced accuracy: {bal_acc:.3f}')
+    return bal_acc
+
+
+# ── 1d cnn ─────────────────────────────────────────────────────────────────────
+def compute_class_weights(y_train):
+    """
+    Custom class weights that balance rare stage detection
+    against Wake recall.
+
+    Fully balanced weights overcorrect on small datasets —
+    Wake recall drops to 0.30 because the model is penalised
+    too heavily for missing rare stages. These manual weights
+    reduce the Wake penalty while keeping N1 and REM prioritised.
+    """
+    class_weight_dict = {
+        0: 0.6,   # Wake  — common, reduce penalty slightly
+        1: 3.5,   # N1    — very rare, keep high penalty
+        2: 0.8,   # N2    — common, slight penalty
+        3: 2.0,   # N3    — moderately rare
+        4: 2.0,   # REM   — moderately rare
+    }
+    print('\n  Class weights:')
+    for cls, w in class_weight_dict.items():
+        print(f'    {STAGE_NAMES[cls]:5s}: {w:.3f}')
+    return class_weight_dict
+
+def plot_training_history(history):
+    """
+    Saves a two-panel plot showing training and validation
+    loss and accuracy across epochs.
+    Useful for spotting overfitting — val loss rising while
+    train loss keeps falling is the warning sign.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # loss
+    axes[0].plot(history.history['loss'],     label='Train loss')
+    axes[0].plot(history.history['val_loss'], label='Val loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training and validation loss')
+    axes[0].legend()
+
+    # accuracy
+    axes[1].plot(history.history['accuracy'],     label='Train accuracy')
+    axes[1].plot(history.history['val_accuracy'], label='Val accuracy')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Accuracy')
+    axes[1].set_title('Training and validation accuracy')
+    axes[1].legend()
 
     plt.tight_layout()
-    path = RESULTS_DIR / 'feature_importance_rf.png'
+    path = RESULTS_DIR / 'cnn_training_history.png'
     plt.savefig(path, dpi=150)
     plt.close()
-    print(f'Feature importance plot saved → {path}')
+    print(f'  Training history saved → {path}')
+
+
+def train_cnn():
+    """Full 1D CNN training pipeline."""
+    print('\n' + '='*60)
+    print('1D CNN TRAINING')
+    print('='*60)
+
+    # load raw epochs — CNN works on raw signal not features
+    X = np.load(RESULTS_DIR / 'X.npy')
+    y = np.load(RESULTS_DIR / 'y.npy')
+    print(f'Raw epochs: {X.shape}')
+
+    X_train, y_train, X_val, y_val, X_test, y_test = split_data(X, y)
+
+    # normalise signal amplitude across training set
+    # we compute mean and std from training data only
+    mean    = X_train.mean()
+    std     = X_train.std()
+    X_train = (X_train - mean) / (std + 1e-8)
+    X_val   = (X_val   - mean) / (std + 1e-8)
+    X_test  = (X_test  - mean) / (std + 1e-8)
+
+    # save normalisation stats for inference later
+    MODELS_DIR.mkdir(exist_ok=True)
+    np.save(MODELS_DIR / 'cnn_norm_stats.npy', np.array([mean, std]))
+    print(f'  Signal normalised — mean: {mean:.6f}, std: {std:.6f}')
+
+    # class weights
+    class_weights = compute_class_weights(y_train)
+
+    # build and compile model
+    from model import build_1d_cnn, compile_model, get_callbacks
+    cnn = build_1d_cnn(
+        input_shape=(X_train.shape[1], X_train.shape[2]),
+        n_classes=5
+    )
+    cnn = compile_model(cnn)
+    print(f'\n  Parameters: {cnn.count_params():,}')
+
+    # train
+    print('\nTraining CNN...')
+    print('(EarlyStopping will halt if val_loss stops improving)\n')
+
+    history = cnn.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=100,
+        batch_size=64,
+        class_weight=class_weights,
+        callbacks=get_callbacks(MODELS_DIR),
+        verbose=1
+    )
+
+    # evaluate
+    y_val_pred  = np.argmax(cnn.predict(X_val,  verbose=0), axis=1)
+    y_test_pred = np.argmax(cnn.predict(X_test, verbose=0), axis=1)
+
+    print_results(y_val,  y_val_pred,  'Validation')
+    bal_acc, kappa = print_results(y_test, y_test_pred, 'Test')
+
+    # plots
+    plot_training_history(history)
+    plot_confusion_matrix(
+        y_test, y_test_pred,
+        '1D CNN — normalised confusion matrix',
+        'confusion_matrix_cnn.png'
+    )
+
+    print(f'\nCNN training complete.')
+    print(f'Test balanced accuracy : {bal_acc:.3f}')
+    print(f'Test Cohen\'s Kappa     : {kappa:.3f}')
+    return bal_acc
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    from features import get_feature_names
+    RESULTS_DIR.mkdir(exist_ok=True)
 
-    # step 1 — load data
-    print('='*60)
-    print('RANDOM FOREST BASELINE TRAINING')
-    print('='*60)
-    X, y = load_features()
-
-    # step 2 — split
-    X_train, y_train, X_val, y_val, X_test, y_test = split_data(X, y)
-
-    # step 3 — scale
-    X_train, X_val, X_test, scaler = scale_features(X_train, X_val, X_test)
-
-    # step 4 — train
-    model = train_random_forest(X_train, y_train)
-
-    # step 5 — evaluate
-    y_test_pred, test_bal_acc = evaluate_model(
-        model, X_val, y_val, X_test, y_test
+    parser = argparse.ArgumentParser(description='Train sleep staging models')
+    parser.add_argument(
+        '--model',
+        choices=['rf', 'cnn', 'both'],
+        default='both',
+        help='Which model to train (default: both)'
     )
+    args = parser.parse_args()
 
-    # step 6 — plots
-    feature_names = get_feature_names()
-    plot_confusion_matrix(y_test, y_test_pred)
-    plot_feature_importance(model, feature_names)
-
-    # step 7 — save model
-    MODELS_DIR.mkdir(exist_ok=True)
-    joblib.dump(model, MODELS_DIR / 'random_forest.pkl')
-    print(f'Model saved → models/random_forest.pkl')
-
-    print(f'\nBaseline complete. Test balanced accuracy: {test_bal_acc:.3f}')
+    if args.model == 'rf':
+        train_random_forest()
+    elif args.model == 'cnn':
+        train_cnn()
+    else:
+        rf_acc  = train_random_forest()
+        cnn_acc = train_cnn()
+        print('\n' + '='*60)
+        print('RESULTS SUMMARY')
+        print('='*60)
+        print(f'Random Forest  — balanced accuracy: {rf_acc:.3f}')
+        print(f'1D CNN         — balanced accuracy: {cnn_acc:.3f}')
+        improvement = (cnn_acc - rf_acc) / rf_acc * 100
+        print(f'CNN improvement over RF: {improvement:+.1f}%')
