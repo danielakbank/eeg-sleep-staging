@@ -85,6 +85,8 @@ def build_1d_cnn(input_shape=(3000, 2), n_classes=5, l2_reg=1e-4):
     x = layers.BatchNormalization(name='bn3')(x)
     x = layers.ReLU(name='relu3')(x)
 
+    
+
     # ── global average pooling ────────────────────────────────────────────────
     # collapses (187, 256) → (256,)
     # averages across all time positions — much better than Flatten
@@ -156,14 +158,14 @@ def get_callbacks(models_dir):
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
             monitor='val_loss',
-            patience=10,
+            patience=15,
             restore_best_weights=True,
             verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.5,
-            patience=4,
+            patience=6,
             min_lr=1e-6,
             verbose=1
         ),

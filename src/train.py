@@ -200,12 +200,13 @@ def compute_class_weights(y_train):
     reduce the Wake penalty while keeping N1 and REM prioritised.
     """
     class_weight_dict = {
-        0: 0.6,   # Wake  — common, reduce penalty slightly
-        1: 3.5,   # N1    — very rare, keep high penalty
-        2: 0.8,   # N2    — common, slight penalty
-        3: 2.0,   # N3    — moderately rare
-        4: 2.0,   # REM   — moderately rare
-    }
+    0: 0.75,  # Wake  — between 0.6 and 1.0
+    1: 4.0,   # N1    — very rare, keep high
+    2: 1.0,   # N2    — increase from 0.8 to help it compete
+    3: 2.5,   # N3    — keep
+    4: 2.5,   # REM   — keep
+}
+
     print('\n  Class weights:')
     for cls, w in class_weight_dict.items():
         print(f'    {STAGE_NAMES[cls]:5s}: {w:.3f}')
