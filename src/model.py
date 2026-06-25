@@ -84,7 +84,6 @@ def build_1d_cnn(input_shape=(3000, 2), n_classes=5, l2_reg=1e-4):
     )(x)
     x = layers.BatchNormalization(name='bn3')(x)
     x = layers.ReLU(name='relu3')(x)
-
     
 
     # ── global average pooling ────────────────────────────────────────────────
