@@ -1,7 +1,7 @@
 # Project-specific
 data/
 models/
-results/
+!results/*.png
 
 # Virtual environment
 venv/
